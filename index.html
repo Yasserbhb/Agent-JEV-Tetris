@@ -1,0 +1,399 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Agent (JEV) playing Tetris</title>
+<style>
+  :root { --bg:#0e1116; --panel:#161b22; --line:#262d38; --fg:#c9d4e3; --dim:#7a8798; --hot:#4ea1ff; }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--fg); font:13px/1.5 ui-monospace,Menlo,Consolas,monospace; }
+  main { display:flex; gap:20px; padding:20px; align-items:flex-start; flex-wrap:wrap; }
+  canvas { background:#0a0d12; border:1px solid var(--line); border-radius:6px; }
+  #lat { width:100%; height:72px; }
+  #nextbox { display:flex; align-items:center; gap:10px; margin-top:8px; }
+  #nextbox .stats { letter-spacing:.14em; font-size:11px; }
+  aside { flex:1; min-width:340px; max-width:620px; }
+  h2 { font-size:11px; letter-spacing:.14em; text-transform:uppercase; color:var(--dim); margin:18px 0 6px; font-weight:600; }
+  h2:first-child { margin-top:0; }
+  button, input { font:inherit; background:var(--panel); color:var(--fg); border:1px solid var(--line);
+                  border-radius:5px; padding:5px 11px; }
+  button:hover:not(:disabled) { border-color:var(--hot); color:#fff; }
+  pre { background:var(--panel); border:1px solid var(--line); border-radius:6px; padding:10px;
+        margin:0; max-height:300px; overflow:auto; white-space:pre-wrap; font-size:11.5px; }
+  .bars { display:grid; grid-template-columns:auto 1fr 3.5em; gap:3px 8px; align-items:center; }
+  .bar { height:9px; background:#222a35; border-radius:2px; overflow:hidden; }
+  .bar i { display:block; height:100%; background:var(--hot); }
+  .pick { color:#fff; font-weight:700; }
+  .stats { color:var(--dim); }
+  .stats b { color:var(--fg); font-weight:600; }
+  .err { color:#ff7b72; }
+</style>
+<main>
+  <div>
+    <canvas id="c" height="600"></canvas>
+    <div id="nextbox"><span class="stats">NEXT</span><canvas id="nx" width="150" height="90"></canvas></div>
+    <p class="stats" id="hud"></p>
+  </div>
+  <aside>
+    <div>
+      <button id="go">Start</button>
+      <button id="one">Step once</button>
+      <button id="new">New game</button>
+      <label style="color:var(--dim)"> gravity <input id="grav" type="number" value="800" min="100" step="100" style="width:5.5em"> ms/row</label>
+    </div>
+    <h2>Jev's answer</h2>
+    <div id="answer" class="stats">not asked yet</div>
+    <h2>Response time</h2>
+    <canvas id="lat" width="580" height="72"></canvas>
+    <div id="meter" class="stats"></div>
+    <h2>State sent to jev</h2>
+    <pre id="sent"></pre>
+    <h2>Raw response</h2>
+    <pre id="got"></pre>
+  </aside>
+</main>
+<script type="module">
+import { COLS, ROWS, KINDS, MOVES, emptyBoard, spawn, cells, valid, shift, drop, lock,
+         metrics, apply, preview, bestPlan, render, turnShapes, rowGaps, wells, fillers } from './tetris.js';
+
+const CELL = 30;
+const DROP_MS = 30;   // per row, so a drop is visible instead of snapping
+const COLOR = { I:'#3fc7d8', O:'#e8c44a', J:'#4b7bec', L:'#e08b3c', S:'#4cc463', T:'#a765e0', Z:'#e05c5c' };
+const NAME = { I:'I (a straight bar of 4)', O:'O (a 2x2 square)', J:'J', L:'L', S:'S', T:'T', Z:'Z' };
+const ACTION = {
+  left: 'Move the piece one column to the left.',
+  right: 'Move the piece one column to the right.',
+  rotate_cw: 'Turn the piece 90 degrees clockwise.',
+  rotate_ccw: 'Turn the piece 90 degrees counter-clockwise.',
+  soft_drop: 'Move the piece down one row. Same columns, just closer to landing.',
+  hard_drop: 'Drop the piece straight down now and lock it in place.',
+  none: 'Do nothing this turn. The piece stays exactly where it is and you will be asked again.',
+};
+
+const $ = (id) => document.getElementById(id);
+const ctx = $('c').getContext('2d');
+const rand = () => KINDS[(Math.random() * KINDS.length) | 0];
+
+let board, piece, next, score, lines, placed, used, hist, over, auto = false, busy = false, tokens = 0;
+const REVERSE = { left: 'right', right: 'left', rotate_cw: 'rotate_ccw', rotate_ccw: 'rotate_cw' };
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+// Net drift plus the last action. The full history is redundant with the piece's
+// position and would grow every turn, so it is summarised instead of listed.
+function plan() {
+  if (!hist.length) return 'nothing yet, it just appeared';
+  const n = (m) => hist.filter((h) => h === m).length;
+  const x = n('right') - n('left');
+  const t = n('rotate_cw') - n('rotate_ccw');
+  return [
+    x === 0 ? 'not moved sideways' : `moved ${Math.abs(x)} column(s) ${x > 0 ? 'right' : 'left'}`,
+    t === 0 ? 'not turned' : `turned ${Math.abs(t)} quarter-turn(s) ${t > 0 ? 'clockwise' : 'anticlockwise'}`,
+    `last action: ${hist[hist.length - 1]}`,
+  ].join('; ');
+}
+
+function reset() {
+  $('c').width = COLS * CELL;
+  board = emptyBoard(); piece = spawn(rand()); next = rand();
+  score = 0; lines = 0; placed = 0; used = 0; hist = []; over = false;
+  $('answer').textContent = 'not asked yet'; $('sent').textContent = ''; $('got').textContent = '';
+  draw();
+}
+
+function draw() {
+  ctx.fillStyle = '#0a0d12'; ctx.fillRect(0, 0, COLS * CELL, ROWS * CELL);
+  ctx.strokeStyle = '#141a22';
+  for (let c = 1; c < COLS; c++) { ctx.beginPath(); ctx.moveTo(c*CELL,0); ctx.lineTo(c*CELL,ROWS*CELL); ctx.stroke(); }
+  for (let r = 1; r < ROWS; r++) { ctx.beginPath(); ctx.moveTo(0,r*CELL); ctx.lineTo(COLS*CELL,r*CELL); ctx.stroke(); }
+  const box = (r, c, k, ghost) => {
+    ctx.fillStyle = COLOR[k]; ctx.globalAlpha = ghost ? .17 : 1;
+    ctx.fillRect(c*CELL+1, r*CELL+1, CELL-2, CELL-2); ctx.globalAlpha = 1;
+  };
+  board.forEach((row, r) => row.forEach((k, c) => k && box(r, c, k)));
+  if (!over) {
+    for (const [r, c] of cells(drop(board, piece))) box(r, c, piece.k, true);
+    for (const [r, c] of cells(piece)) box(r, c, piece.k);
+  }
+  drawNext();
+  const m = metrics(board);
+  $('hud').innerHTML = 'score <b>' + score + '</b> &middot; lines <b>' + lines + '</b> &middot; pieces <b>'
+    + placed + '</b> &middot; holes <b>' + m.holes + '</b> &middot; next <b>' + next + '</b>'
+    + (over ? ' &middot; <b class="err">GAME OVER</b>' : '');
+}
+
+// The next piece, drawn at its spawn orientation and centred in its box.
+function drawNext() {
+  const c = $('nx'), x = c.getContext('2d'), s = 22;
+  x.fillStyle = '#0a0d12'; x.fillRect(0, 0, c.width, c.height);
+  const cs = cells({ k: next, rot: 0, x: 0, y: 0 });
+  const rs = cs.map((p) => p[0]), col = cs.map((p) => p[1]);
+  const ox = (c.width - (Math.max(...col) - Math.min(...col) + 1) * s) / 2 - Math.min(...col) * s;
+  const oy = (c.height - (Math.max(...rs) - Math.min(...rs) + 1) * s) / 2 - Math.min(...rs) * s;
+  x.fillStyle = COLOR[next];
+  for (const [r, cc] of cs) x.fillRect(ox + cc * s + 1, oy + r * s + 1, s - 2, s - 2);
+}
+
+// Everything numeric jev sees is measured here. Per the jev-1.13 jaggedness docs it
+// cannot count a grid reliably, so it only ever judges pre-computed consequences.
+function buildPayload() {
+  const m = metrics(board);
+  const heights = {};
+  m.heights.forEach((h, c) => { heights['column_' + c] = h; });
+
+  const target = bestPlan(board, piece);   // not `plan`: that name is the move-history summary
+  const criteria = {};
+  for (const move of MOVES) {
+    const p = preview(board, piece, move);
+    if (!p) continue;                                   // illegal move: do not offer it
+    if (move === 'none') {
+      criteria[move] = { does: ACTION[move], note: 'Only when no other option improves the position.' };
+      continue;
+    }
+    criteria[move] = {
+      does: ACTION[move],
+      then_lands: {
+        in_columns: p.columns[0] === p.columns[1]
+          ? String(p.columns[0]) : p.columns[0] + '-' + p.columns[1],
+        on_row: p.lands_on_row,
+        clears_lines: p.lines_cleared,
+        new_holes: p.new_holes_created,
+        roughness_after: p.surface_roughness_after,
+      },
+    };
+    if (move === REVERSE[hist[hist.length - 1]])
+      criteria[move].warning = 'Reverses your last action. You end up back where you started, one row lower.';
+
+    if (target && move === target.next_action)
+      criteria[move].this_starts_the_best_plan =
+        `The best placement found for this piece is columns ${target.columns[0]}-${target.columns[1]}, ` +
+        `on_row ${target.lands_on_row}, clears ${target.lines_cleared}, new_holes ` +
+        `${target.new_holes_created}. This action is the first step towards it.`;
+  }
+
+  return {
+    model: 'jev-latest',
+    state: {
+      rules:
+        `Tetris. The board is ${COLS} columns wide (0 = far left) and ${ROWS} rows tall (row 0 = top, row ` +
+        `${ROWS - 1} = floor). One piece falls at a time; each turn you give it one action. ` +
+        `GRAVITY: it also drops one row every ${gravityMs()}ms whether you act or not, and you answer about every ` +
+        `${thinkMs}ms, so you get roughly ${movesPerRow()} action(s) per row of fall. When it can fall no further ` +
+        `it locks and the next piece starts at the top. A row with all ${COLS} squares filled CLEARS: it scores, ` +
+        `it vanishes, and everything above drops down. Clearing is the only thing that lowers the stack. ` +
+        `An empty square with a block above it is a HOLE: nothing can ever reach it, and its row cannot clear ` +
+        `until every row above has gone. The game ENDS when the stack reaches the top.`,
+      goal:
+        'Keep the stack low and flat, and clear rows. Pack each piece snugly against what is already there with ' +
+        'no gap sealed underneath. A tall jagged stack full of holes dies within a few pieces; a low flat one ' +
+        'runs forever.',
+      board: {
+        legend: "'.' empty, '#' settled block, '@' the falling piece, '+' its landing shadow (exactly where it " +
+          'stops if you leave it alone). One line per row, labelled with its row number.',
+        columns: '        ' + [...Array(COLS).keys()].map((c) => c % 10).join(''),
+        rows: render(board, piece).map((row, r) => `row ${String(r).padStart(2)}: ${row}`),
+      },
+      falling_piece: {
+        name: NAME[piece.k],
+        shapes: turnShapes(piece),
+        in_columns: [...new Set(cells(piece).map((x) => x[1]))],
+        lands_on_row_if_untouched: preview(board, piece, 'none').lands_on_row,
+        rows_of_fall_left: drop(board, piece).y - piece.y,
+        actions_left: movesLeft(),
+        done_so_far: plan(),
+        best_placement_found: target
+          ? `columns ${target.columns[0]}-${target.columns[1]}, on_row ${target.lands_on_row}, clears ` +
+            `${target.lines_cleared}, new_holes ${target.new_holes_created}. Reaching it takes ` +
+            `${target.actions_needed} action(s) and you have about ${movesLeft()}. ` +
+            `Start with: ${target.next_action}.`
+          : 'none',
+      },
+      next_piece: { name: NAME[next], shapes: turnShapes({ k: next, rot: 0, x: 0, y: 0 }) },
+      stack: {
+        column_heights: heights,
+        tallest: m.maxHeight,
+        holes: m.holes,
+        roughness: m.bumpiness,
+        dips_you_can_fill: wells(board).slice(0, 4).map((w) => {
+          const f = fillers(board, w.column);
+          return `column ${w.column}: ${w.depth} row(s) below its neighbours, floor at height ${w.height}. ` +
+            (f.length ? `Fits cleanly: ${f.join(', ')}${f.length <= 2 ? ' ONLY - do not waste or bury it' : ''}.`
+                      : 'Nothing fits here cleanly any more.');
+        }),
+        rows_near_completing: rowGaps(board).slice(0, 4).map((g) =>
+          `row ${g.row}: needs ${g.empty_columns.length}, at column(s) ${g.empty_columns.join(', ')}`),
+      },
+      progress: { score, rows_cleared: lines, pieces_placed: placed },
+    },
+    questions: {
+      move: {
+        type: 'choice',
+        instructions: {
+          task: 'Choose the single next action for the falling piece.',
+          priorities_in_order: [
+            '1. CLEAR A LINE. clears_lines above 0 means that placement completes rows and shortens the stack.',
+            '2. LAND LOW. on_row is how deep the piece settles and BIGGER means LOWER. Take the biggest on_row ' +
+              'you can reach. Never stack onto a tall column while a lower one is still reachable: that is how a ' +
+              'mountain grows in the middle while the sides stay empty, and it is the fastest way to lose.',
+            '3. MAKE NO HOLES. new_holes above 0 means you are sealing squares that can never be filled again and ' +
+              'freezing every row they sit in. Prefer 0.',
+            '4. STAY FLAT. Lower roughness_after means the next piece has somewhere to sit.',
+            '5. LEAVE GAPS THAT SOME PIECE CAN ACTUALLY FILL. You cannot avoid leaving gaps, so leave deliberate ' +
+              'ones. Each entry in stack.dips_you_can_fill names the pieces that still fit it. A dip only one or ' +
+              'two pieces fit is precious: do not cover it, and spend the matching piece on it when it arrives. ' +
+              'A dip nothing fits is dead weight you created. Check next_piece: if it fits an open dip, leave that ' +
+              'dip alone this turn and put the current piece elsewhere.',
+          ],
+          where_to_aim:
+            'stack.dips_you_can_fill lists the surface dips a piece can still drop into, deepest first. ' +
+            'stack.rows_near_completing lists the rows closest to clearing and exactly which columns they are ' +
+            'missing. Both are already filtered to what is reachable. Steer the piece over those columns.',
+          tie_breakers: [
+            'Commit. falling_piece.done_so_far says how far you have already moved and turned it; carry on rather ' +
+              'than reversing. An option marked warning undoes your last action.',
+            'Once the landing shadow is where you want it, drop it. There is no reward for unused turns.',
+            'When every option scores the same, as on a flat or empty board, head for an edge and pack from one ' +
+              'side rather than dropping where the piece happened to appear.',
+            'When every option looks BAD, do not thrash. There is always a least-bad one: fewest new_holes first, ' +
+              'then biggest on_row. Pick it and see the piece through. Drifting between options while the piece ' +
+              'sinks spends your turns and lands it wherever it happened to be, which is worse than any choice ' +
+              'you could have made on purpose.',
+          ],
+          important:
+            'Every number in the options was measured from the board by the game, and says what happens if the ' +
+            'piece falls straight down right after that action. Judge the options on those numbers. Do not try to ' +
+            'count squares in the grid yourself.',
+        },
+        criteria: criteria,
+      },
+    },
+  };
+}
+
+// Fall one row at a time so a hard drop is something you can watch.
+async function fall() {
+  for (;;) {
+    const n = shift(board, piece, 0, 1);
+    if (!n) return;
+    piece = n; draw(); await sleep(DROP_MS);
+  }
+}
+
+// Gravity runs on the clock, not per request, so jev can fit several actions into
+// one row of fall the way a human player does.
+let lastDrop = 0, thinkMs = 500;
+const gravityMs = () => Math.max(100, +$('grav').value || 800);
+const movesPerRow = () => Math.max(1, Math.round(gravityMs() / Math.max(thinkMs, 1)));
+const movesLeft = () => movesPerRow() * (drop(board, piece).y - piece.y);
+
+// Response time over the last 60 requests, in milliseconds.
+const lat = [];
+function drawLat() {
+  const c = $('lat'), x = c.getContext('2d'), W = c.width, H = c.height, pad = 6;
+  x.clearRect(0, 0, W, H);
+  if (!lat.length) return;
+  const pts = lat.slice(-60);
+  const top = Math.max(...pts) * 1.15 || 1;
+  const px = (i) => (pts.length < 2 ? 0 : (i / (pts.length - 1)) * (W - 34));
+  const py = (v) => H - pad - (v / top) * (H - pad * 2);
+
+  x.strokeStyle = '#262d38';                                  // ms gridlines
+  x.fillStyle = '#7a8798'; x.font = '10px ui-monospace,monospace';
+  for (const f of [0, 0.5, 1]) {
+    const v = Math.round(top * f), y = py(v);
+    x.beginPath(); x.moveTo(0, y); x.lineTo(W - 34, y); x.stroke();
+    x.fillText(v + 'ms', W - 31, y + 3);
+  }
+  x.strokeStyle = '#4ea1ff'; x.lineWidth = 1.5; x.beginPath();
+  pts.forEach((v, i) => (i ? x.lineTo(px(i), py(v)) : x.moveTo(px(i), py(v))));
+  x.stroke();
+  x.fillStyle = '#4ea1ff';
+  x.beginPath(); x.arc(px(pts.length - 1), py(pts[pts.length - 1]), 2.5, 0, 7); x.fill();
+
+  const avg = Math.round(lat.reduce((s, v) => s + v, 0) / lat.length);
+  $('meter').innerHTML = 'last <b>' + lat[lat.length - 1] + 'ms</b> &middot; avg <b>' + avg
+    + 'ms</b> &middot; min <b>' + Math.min(...lat) + 'ms</b> &middot; max <b>' + Math.max(...lat)
+    + 'ms</b> &middot; <b>' + tokens.toLocaleString() + '</b> tokens over <b>' + lat.length + '</b> requests';
+}
+
+// Catch up however many rows are due: a slow request must not cheat gravity.
+function gravity() {
+  while (performance.now() - lastDrop >= gravityMs()) {
+    lastDrop += gravityMs();
+    const g = shift(board, piece, 0, 1);
+    if (!g) { lockPiece(); lastDrop = performance.now(); return true; }
+    piece = g;
+  }
+  return false;
+}
+
+async function applyMove(move) {
+  used++; hist.push(move);
+  if (move === 'hard_drop') { await fall(); lockPiece(); lastDrop = performance.now(); return; }
+  if (move === 'soft_drop') {
+    const n = shift(board, piece, 0, 1);
+    if (n) { piece = n; draw(); await sleep(DROP_MS); } else { lockPiece(); lastDrop = performance.now(); return; }
+  } else if (move !== 'none') {
+    piece = apply(board, piece, move) || piece;
+  }
+  gravity();
+}
+
+function lockPiece() {
+  const out = lock(board, piece);
+  board = out.board;
+  lines += out.lines; placed++; used = 0; hist = [];
+  score += [0, 100, 300, 500, 800][out.lines];
+  piece = spawn(next); next = rand();
+  if (!valid(board, piece)) { over = true; auto = false; $('go').textContent = 'Start'; }
+}
+
+function showAnswer(a, ms, tok) {
+  const rows = Object.entries(a.probabilities).sort((x, y) => y[1] - x[1]).map(function (e) {
+    return '<span class="' + (e[0] === a.choice ? 'pick' : '') + '">' + e[0] + '</span>'
+      + '<span class="bar"><i style="width:' + (e[1] * 100).toFixed(1) + '%"></i></span>'
+      + '<span>' + (e[1] * 100).toFixed(1) + '%</span>';
+  }).join('');
+  $('answer').innerHTML = '<div style="margin-bottom:6px">move <span class="pick">' + a.choice
+    + '</span> &middot; confidence <b>' + a.confidence.toFixed(2) + '</b> &middot; <b>' + ms + 'ms</b>'
+    + ' (avg <b>' + thinkMs + 'ms</b>) &middot; <b>' + tok + '</b> tokens &middot; '
+    + Math.max(1, Math.round(gravityMs() / Math.max(thinkMs, 1))) + ' move(s) per row of fall'
+    + '</div><div class="bars">' + rows + '</div>';
+}
+
+async function step() {
+  if (over || busy) return;
+  busy = true;
+  try {
+    const payload = buildPayload();
+    $('sent').textContent = JSON.stringify(payload, null, 2);
+    const t0 = performance.now();
+    const r = await fetch('/move', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+                                     body: JSON.stringify(payload) });
+    const json = await r.json();
+    const ms = Math.round(performance.now() - t0);
+    thinkMs = Math.round(thinkMs * 0.7 + ms * 0.3);   // rolling latency
+    lat.push(ms);
+    if (json.usage) tokens += json.usage.input_tokens + json.usage.output_tokens;
+    drawLat();
+    $('got').textContent = JSON.stringify(json, null, 2);
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    showAnswer(json.answers.move, ms, json.usage.input_tokens);
+    await applyMove(json.answers.move.choice);
+    draw();
+  } catch (e) {
+    auto = false; $('go').textContent = 'Start';
+    $('answer').innerHTML = '<span class="err">' + e.message + ' &mdash; see the raw response below</span>';
+  } finally { busy = false; }
+}
+
+async function loop() {
+  while (auto && !over) {
+    await step();
+    // No artificial delay: the API round trip already paces the loop.
+  }
+}
+
+$('go').onclick = () => { auto = !auto; $('go').textContent = auto ? 'Pause' : 'Start'; if (auto) loop(); };
+$('one').onclick = step;
+$('new').onclick = () => { auto = false; $('go').textContent = 'Start'; reset(); };
+reset();
+</script>

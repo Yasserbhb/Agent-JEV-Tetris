@@ -6,10 +6,10 @@ seven legal moves, and plays back whatever jev picks.
 
 ## Demo
 
-<!--
-  Drag a 30s screen recording (.mp4 or .mov) into this section while editing the README
-  on github.com. GitHub uploads it and replaces this comment with the video link.
--->
+![Agent (JEV) playing Tetris](demo.gif)
+
+*363 pieces in, 114 lines cleared, zero holes. The panel on the right is the exact JSON sent to
+jev each turn, and its answer with the probability it gave every legal move.*
 
 ## Why the game does the maths
 
